@@ -1,4 +1,4 @@
-
+#!/usr/bin/env python
 
 from idaapi import *
 from idc import *
