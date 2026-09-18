@@ -1,4 +1,44 @@
 #!/usr/bin/env python
+'''
+
+PS5 Kernel Loader
+
+Based on the PS4 Kernel Loader by SocraticBliss (R)
+
+Major Thanks to...
+# SocraticBliss (ps4_kernel.py, the base for this loader)
+# aerosoul, balika011, Znullptr, Pablo (kozarovv), ChendoChap
+# xyz, CelesteBlue, kiwidogg, motoharu, noname120, flatz
+# Team Reswitched
+
+ps5_kernel.py: IDA loader for reading Sony PlayStation(R) 5 Kernel files
+
+--------------------------------------------------------------------------------
+What is different from the PS4 kernel, and why this loader exists
+--------------------------------------------------------------------------------
+
+1) The PS5 kernel ELF ships with an *unapplied* R_X86_64_RELATIVE relocation
+   table (DT_RELA / DT_RELASZ). Every single qword that holds a pointer is
+   ZERO in the file. Without applying those relocations you get no syscall
+   table, no cdevsw, no sysinit, nothing. This loader applies all of them.
+
+2) The PS5 kernel has TWO syscall tables (three sysentvec's in total):
+       "Native SELF"   -> the PS5 / Prospero syscall table
+       "PS4 SELF"      -> the PS4 / Orbis compatibility syscall table
+       "FreeBSD ELF64" -> shares the native table, kept for the ELF brand
+   Both are located and labelled.
+
+3) Every indirectly-reachable function goes through an 8-byte CFI/XO thunk
+   (`jmp rel32; int3; int3; int3`). The sysent and cdevsw tables point at the
+   *thunks*, not the real functions. This loader resolves through them so the
+   real function gets the name, and the thunk gets a `j_` prefix.
+
+4) The Sony sysentvec layout is FreeBSD 11's minus sv_errsize / sv_errtbl,
+   so sv_name lands at +0x48 and sv_syscallnames at +0xB8 (not +0x60 / +0xD0
+   like on the PS4). The loader still probes for those fields dynamically so
+   it keeps working if Sony shuffles the struct on a future firmware.
+
+'''
 
 from idaapi import *
 from idc import *
@@ -28,7 +68,7 @@ class Binary:
                  'E_PHT_SIZE', 'E_PHT_COUNT', 'E_SHT_SIZE', 'E_SHT_COUNT',
                  'E_SHT_INDEX', 'E_SEGMENTS', 'E_SECTIONS', 'FILE_BASE', 'VALID')
 
-
+    # Elf Types
     ET_NONE                   = 0x0
     ET_REL                    = 0x1
     ET_EXEC                   = 0x2
@@ -43,17 +83,18 @@ class Binary:
     ET_LOPROC                 = 0xff00
     ET_HIPROC                 = 0xffff
 
-
+    # Elf Architecture
     EM_X86_64                 = 0x3e
 
-
+    # Elf OS/ABI
     ELFOSABI_FREEBSD          = 0x9
 
-
+    # Kernel virtual address window (KVA, 0xFFFFFFFF8xxxxxxx)
     KERNEL_MIN                = 0xFFFFFFFF80000000
-
+    # The PS4 kernel is linked at 0xFFFFFFFF82200000, the PS5 kernel well below it
     PS4_KERNEL_BASE           = 0xFFFFFFFF82200000
 
+    # Some firmwares (14.00+) wrap the real kernel ELF in a 0x1000 byte header
     WRAPPER_OFFSETS           = (0x0, 0x1000)
 
     def __init__(self, f, base = None):
@@ -87,7 +128,7 @@ class Binary:
             self.EI_PADDING    = struct.unpack('6x', f.read(6))
             self.EI_SIZE       = struct.unpack('<B', f.read(1))[0]
 
-            
+            # Elf Properties
             self.E_TYPE        = struct.unpack('<H', f.read(2))[0]
             self.E_MACHINE     = struct.unpack('<H', f.read(2))[0]
             self.E_VERSION     = struct.unpack('<I', f.read(4))[0]
@@ -104,7 +145,7 @@ class Binary:
         except Exception:
             return False
 
-
+        # 64-bit little-endian x86_64 only
         if self.EI_CLASS != 0x2 or self.EI_DATA != 0x1:
             return False
         if self.E_MACHINE != Binary.EM_X86_64:
@@ -112,6 +153,7 @@ class Binary:
         if self.E_PHT_SIZE != 0x38 or not 0 < self.E_PHT_COUNT < 0x40:
             return False
 
+        # Kernel virtual address, and below where the PS4 kernel lives
         if not Binary.KERNEL_MIN <= self.E_START_ADDR < Binary.PS4_KERNEL_BASE:
             return False
 
@@ -121,13 +163,15 @@ class Binary:
         except Exception:
             return False
 
-
+        # Needs a dynamic segment plus text and data. The early proto kernels
+        # ship two loadable segments, later firmwares split rodata out into a
+        # third (and the 8.50+ layout adds a fourth)
         loads = [x for x in self.E_SEGMENTS if x.TYPE == Segment.PT_LOAD]
         dyn   = [x for x in self.E_SEGMENTS if x.TYPE == Segment.PT_DYNAMIC]
         if len(loads) < 2 or not dyn:
             return False
 
-
+        # The first loadable segment must be the kernel text
         if not Binary.KERNEL_MIN <= loads[0].MEM_ADDR < Binary.PS4_KERNEL_BASE:
             return False
 
@@ -141,7 +185,7 @@ class Binary:
         self.FILE_BASE = base
         return True
 
-
+    # Virtual address -> file offset, using the program headers
     def v2f(self, address):
 
         for segm in self.E_SEGMENTS:
@@ -153,31 +197,31 @@ class Binary:
 
     def procomp(self, processor, pointer, til):
 
-
+        # Processor Type
         idc.set_processor_type(processor, SETPROC_LOADER)
 
-        
+        # Compiler Attributes
         idc.set_inf_attr(INF_COMPILER, COMP_GNU)
         idc.set_inf_attr(INF_MODEL, pointer)
         idc.set_inf_attr(INF_SIZEOF_BOOL, 0x1)
         idc.set_inf_attr(INF_SIZEOF_LONG, 0x8)
         idc.set_inf_attr(INF_SIZEOF_LDBL, 0x10)
 
-        
+        # Type Library
         idc.add_default_til(til)
 
-        
+        # Assume GCC3 Names
         idc.set_inf_attr(INF_DEMNAMES, DEMNAM_GCC3 | DEMNAM_NAME)
 
-        
+        # File Type
         idc.set_inf_attr(INF_FILETYPE, FT_ELF)
 
-        
-        
-        
+        # Analysis Flags
+        # (unchecked) Delete instructions with no xrefs
+        # (unchecked) Coagulate data segments in the final pass
         idc.set_inf_attr(INF_AF, 0xDFFFFFDF)
 
-        
+        # Return Bitsize
         return self.EI_CLASS
 
 
@@ -186,7 +230,7 @@ class Segment:
     __slots__ = ('TYPE', 'FLAGS', 'OFFSET', 'MEM_ADDR',
                  'FILE_ADDR', 'FILE_SIZE', 'MEM_SIZE', 'ALIGNMENT', 'LABEL')
 
-    
+    # Segment Types
     PT_NULL                = 0x0
     PT_LOAD                = 0x1
     PT_DYNAMIC             = 0x2
@@ -206,7 +250,7 @@ class Segment:
     PT_SCE_COMMENT         = 0x6fffff00
     PT_SCE_LIBVERSION      = 0x6fffff01
 
-    
+    # Segment Alignments
     AL_NONE                = 0x0
     AL_BYTE                = 0x1
     AL_WORD                = 0x2
@@ -244,7 +288,7 @@ class Segment:
 
         return self.FLAGS & 0xF
 
-    
+    # Base name, before de-duplication
     def name(self):
 
         if self.TYPE == Segment.PT_LOAD:
@@ -324,7 +368,7 @@ class Dynamic:
 
     __slots__ = ('TAG', 'VALUE')
 
-    
+    # Dynamic Tags
     (DT_NULL, DT_NEEDED, DT_PLTRELSZ, DT_PLTGOT, DT_HASH, DT_STRTAB, DT_SYMTAB,
     DT_RELA, DT_RELASZ, DT_RELAENT, DT_STRSZ, DT_SYMENT, DT_INIT, DT_FINI,
     DT_SONAME, DT_RPATH, DT_SYMBOLIC, DT_REL, DT_RELSZ, DT_RELENT, DT_PLTREL,
@@ -341,7 +385,7 @@ class Dynamic:
     DT_VERDEF                   = 0x6ffffffc
     DT_VERDEFNUM                = 0x6ffffffd
 
-    
+    # Collected values
     TABLE = {}
 
     def __init__(self, f):
@@ -395,19 +439,19 @@ class Dynamic:
             Dynamic.DT_FLAGS_1         : 'DT_FLAGS_1',
             Dynamic.DT_VERDEF          : 'DT_VERDEF',
             Dynamic.DT_VERDEFNUM       : 'DT_VERDEFNUM',
-        }.get(self.TAG, 'DT_%
+        }.get(self.TAG, 'DT_%#x' % self.TAG)
 
     def process(self):
 
         Dynamic.TABLE[self.TAG] = self.VALUE
-        return '%s | %
+        return '%s | %#x' % (self.tag(), self.VALUE)
 
 
 class Relocation:
 
     __slots__ = ('OFFSET', 'INFO', 'ADDEND')
 
-    
+    # PS5 (X86_64) Relocation Codes
     (R_X86_64_NONE, R_X86_64_64, R_X86_64_PC32, R_X86_64_GOT32,
     R_X86_64_PLT32, R_X86_64_COPY, R_X86_64_GLOB_DAT, R_X86_64_JUMP_SLOT,
     R_X86_64_RELATIVE, R_X86_64_GOTPCREL, R_X86_64_32, R_X86_64_32S,
@@ -431,9 +475,9 @@ class Relocation:
     }
 
 
-
-
-
+# --------------------------------------------------------------------------------------
+# Helpers
+# --------------------------------------------------------------------------------------
 
 def u64(value):
 
@@ -447,7 +491,7 @@ def s32(value):
 
 def make_struct(name, members):
 
-    
+    ''' Create (or fetch) a structure and return its id '''
 
     entry = idc.get_struc_id(name)
     if entry not in (BADADDR, -1):
@@ -484,7 +528,7 @@ def apply_struct(address, size, sid):
         return ida_bytes.create_struct(address, size, sid)
 
 
-
+# Since IDA cannot create a compatibility layer to save its life...
 def find_binary(address, end, search, radix, flags):
 
     if idaapi.IDA_SDK_VERSION > 760:
@@ -492,10 +536,10 @@ def find_binary(address, end, search, radix, flags):
         idaapi.parse_binpat_str(binpat, address, search, radix)
 
         try:
-            
+            # 9.0+
             address, _ = idaapi.bin_search(address, end, binpat, flags)
         except Exception:
-            
+            # 9.0 Beta
             address, _ = idaapi.bin_search3(address, end, binpat, flags)
     else:
         address = idaapi.find_binary(address, end, search, radix, flags)
@@ -515,7 +559,7 @@ def qword_pattern(value):
 
 def segments():
 
-    
+    ''' All loaded segments, in address order '''
 
     result = []
     for index in range(ida_segment.get_segm_qty()):
@@ -561,7 +605,7 @@ def cstring(address, limit = 0x100):
 
 def find_string(text, terminated = True):
 
-    
+    ''' Locate an ASCII string in any loaded segment '''
 
     blob = text.encode('ascii')
     pattern = bytes_pattern(blob + b'\x00' if terminated else blob)
@@ -576,12 +620,12 @@ def find_string(text, terminated = True):
 
 def sanitize(name):
 
-    
+    ''' FreeBSD/Sony syscall name -> valid IDA identifier '''
 
     if not name:
         return None
 
-    if name.startswith('
+    if name.startswith('#'):
         return None
     if name.startswith('obs_{') or name == 'obs_{':
         return None
@@ -596,7 +640,7 @@ def sanitize(name):
 
 def set_func_name(address, name):
 
-    
+    ''' Name a function, creating it if IDA has not seen it yet '''
 
     if not in_code(address):
         return False
@@ -614,14 +658,14 @@ def has_name(address):
     return bool(idaapi.get_name(address))
 
 
-
-
-
-
-
-
-
-
+# --------------------------------------------------------------------------------------
+# CFI / execute-only thunks
+#
+# Every indirectly-called kernel function is reached through an 8-byte slot:
+#     E9 xx xx xx xx    jmp   real_function
+#     CC CC CC          int3 padding
+# Data tables (sysent, cdevsw, sysinit, ...) hold the address of the *thunk*.
+# --------------------------------------------------------------------------------------
 
 def is_thunk(address):
 
@@ -638,7 +682,7 @@ def is_thunk(address):
 
 def thunk_target(address):
 
-    
+    ''' Follow a CFI thunk to the real function (identity if not a thunk) '''
 
     if not is_thunk(address):
         return address
@@ -649,7 +693,7 @@ def thunk_target(address):
 
 def prospero(code):
 
-    
+    ''' Carve out every CFI thunk so IDA shows j_<name> instead of sub_<addr> '''
 
     address = code.start_ea
     total = 0
@@ -659,7 +703,7 @@ def prospero(code):
         if address == BADADDR:
             break
 
-        
+        # Thunks are 8-byte aligned inside the thunk table
         if address & 0x7:
             address += 1
             continue
@@ -669,8 +713,8 @@ def prospero(code):
             address += 8
             continue
 
-        
-        
+        # A lone `jmp rel32` followed by int3 padding at the tail of a real
+        # function looks the same - only take slots that sit in a thunk run
         if not (is_thunk(address - 8) or is_thunk(address + 8)):
             address += 8
             continue
@@ -689,11 +733,11 @@ def prospero(code):
     return total
 
 
+# --------------------------------------------------------------------------------------
+# Znullptr's Syscalls, PS5 edition - the kernel carries two of these tables
+# --------------------------------------------------------------------------------------
 
-
-
-
-
+# sysentvec, as shipped by Sony: FreeBSD 11 minus sv_errsize / sv_errtbl
 SYSENTVEC = [('sv_size',                'Number of syscalls',            0x4),
              ('_pad',                   'Padding',                       0x4),
              ('sv_table',               'Syscall table',                 0x8),
@@ -733,13 +777,13 @@ SYSENTVEC = [('sv_size',                'Number of syscalls',            0x4),
 
 SYSENTVEC_SIZE = 0xF8
 
-
+# Where sv_name normally lives; probed dynamically as well
 SV_NAME_OFFSETS = (0x48, 0x58, 0x60)
 
 
 def looks_like_sysent(table, count = 8):
 
-    
+    ''' A sysent[] is an array of 0x30 byte { narg, pad, sy_call, ... } entries '''
 
     if not is_mapped(table):
         return False
@@ -759,7 +803,7 @@ def looks_like_sysent(table, count = 8):
 
 def looks_like_syscallnames(table):
 
-    
+    ''' sv_syscallnames[0..2] == "syscall", "exit", "fork" '''
 
     if not is_mapped(table):
         return False
@@ -774,7 +818,10 @@ def looks_like_syscallnames(table):
 
 def find_sysentvec(name):
 
-
+    '''
+    Locate a sysentvec by its sv_name string, then work out where sv_table,
+    sv_size and sv_syscallnames actually sit inside the structure.
+    '''
 
     string = find_string(name)
     if string == BADADDR:
@@ -824,9 +871,12 @@ def find_sysentvec(name):
 
 def znullptr(tables, struct_sysent, struct_sysentvec):
 
+    '''
+    Label both syscall tables. sysent[].sy_call points at a CFI thunk, so the
+    real function is named sys_<name> and the thunk j_sys_<name>.
+    '''
 
-
-    
+    # Pass 1 - collect every (target -> names) mapping across both tables
     targets = {}
 
     for tag, info in tables:
@@ -838,7 +888,7 @@ def znullptr(tables, struct_sysent, struct_sysentvec):
             raw = cstring(idaapi.get_qword(names + index * 0x8))
             targets.setdefault(real, []).append((tag, index, raw, thunk))
 
-    
+    # nosys is whatever syscall 0 of the first table resolves to
     first = tables[0][1]
     nosys = thunk_target(idaapi.get_qword(first['sv_table'] + 0x8))
 
@@ -857,14 +907,14 @@ def znullptr(tables, struct_sysent, struct_sysentvec):
         elif len(set(clean)) == 1:
             chosen[real] = clean[0]
         elif len(users) <= 4:
-            
+            # A handful of aliases - prefer the plainest name
             plain = [x for x in clean if not x.startswith(('compat', 'obs_', 'freebsd'))]
             chosen[real] = (plain or clean)[0]
         else:
-            
+            # A shared "not implemented" stub used by many syscalls
             chosen[real] = 'sysent_stub_%X' % (real & 0xFFFFFFFF)
 
-    
+    # Pass 2 - apply the names
     for real, name in chosen.items():
         if set_func_name(real, 'sys_' + name):
             try:
@@ -878,12 +928,12 @@ def znullptr(tables, struct_sysent, struct_sysentvec):
     for tag, info in tables:
         sysvec, table, names, size = info['sysentvec'], info['sv_table'], info['sv_names'], info['sv_size']
 
-        print('
+        print('#   %-14s sysentvec:%#x sv_table:%#x sv_syscallnames:%#x (%i syscalls)' %
               (tag, sysvec, table, names, size))
 
         idaapi.set_name(sysvec, 'sysentvec_%s' % tag, SN_NOCHECK | SN_NOWARN | SN_FORCE)
 
-        
+        # "FreeBSD ELF64" shares the native table - do not steal the ps5 labels
         if not idaapi.get_name(table).startswith('sv_table_'):
             idaapi.set_name(table, 'sv_table_%s' % tag, SN_NOCHECK | SN_NOWARN | SN_FORCE)
         if not idaapi.get_name(names).startswith('sv_syscallnames_'):
@@ -896,8 +946,8 @@ def znullptr(tables, struct_sysent, struct_sysentvec):
             entry = table + index * 0x30
             apply_struct(entry, 0x30, struct_sysent)
 
-            raw = cstring(idaapi.get_qword(names + index * 0x8)) or '
-            idc.set_cmt(entry, '
+            raw = cstring(idaapi.get_qword(names + index * 0x8)) or '#%i' % index
+            idc.set_cmt(entry, '#%i %s' % (index, raw), False)
 
             thunk = idaapi.get_qword(table + index * 0x30 + 0x8)
             real = thunk_target(thunk)
@@ -907,7 +957,7 @@ def znullptr(tables, struct_sysent, struct_sysentvec):
                 idaapi.set_name(thunk, 'j_sys_%s' % chosen.get(real, 'nosys'),
                                 SN_NOCHECK | SN_NOWARN | SN_FORCE)
 
-            
+            # Name table slot
             slot = names + index * 0x8
             idc.create_data(slot, FF_QWORD, 0x8, BADNODE)
             idc.op_plain_offset(slot, 0, 0)
@@ -915,9 +965,9 @@ def znullptr(tables, struct_sysent, struct_sysentvec):
     return len(chosen)
 
 
-
-
-
+# --------------------------------------------------------------------------------------
+# Chendo's cdevsw con-struct-or
+# --------------------------------------------------------------------------------------
 
 CDEVSW_OPS = [(0x10, 'open'), (0x18, 'fdopen'), (0x20, 'close'), (0x28, 'read'),
               (0x30, 'write'), (0x38, 'ioctl'), (0x40, 'poll'), (0x48, 'mmap'),
@@ -967,9 +1017,9 @@ def chendo(struct_cdevsw):
     return total
 
 
-
-
-
+# --------------------------------------------------------------------------------------
+# Pablo's IDC
+# --------------------------------------------------------------------------------------
 
 def pablo(mode, address, end, search):
 
@@ -997,19 +1047,24 @@ def pablo(mode, address, end, search):
             address += 1
 
 
-
-
-
+# --------------------------------------------------------------------------------------
+# Kiwidog's __stack_chk_fail
+# --------------------------------------------------------------------------------------
 
 def find_lea_ref(code, target):
 
+    '''
+    Find `lea reg, [rip + disp32]` pointing at `target`.
 
+    The loader runs before autoanalysis, so there are no cross references to
+    follow yet - scan the raw text bytes instead.
+    '''
 
     blob = ida_bytes.get_bytes(code.start_ea, code.end_ea - code.start_ea)
     if not blob:
         return BADADDR
 
-    
+    # 48 8D /r with mod=00 rm=101 -> rip relative, for rax/rcx/rdx/rbx/rsi/rdi
     for prefix in (b'\x48\x8d\x3d', b'\x48\x8d\x35', b'\x48\x8d\x15',
                    b'\x48\x8d\x0d', b'\x48\x8d\x05', b'\x48\x8d\x1d'):
         position = blob.find(prefix)
@@ -1028,7 +1083,7 @@ def find_lea_ref(code, target):
 
 def function_start(address, limit = 0x200):
 
-    
+    ''' Walk back to the nearest `push rbp; mov rbp, rsp` prologue '''
 
     for delta in range(0, limit):
         candidate = address - delta
@@ -1068,13 +1123,13 @@ def kiwidog(code):
     idaapi.set_name(function.start_ea, '__stack_chk_fail', SN_NOCHECK | SN_NOWARN | SN_FORCE)
     function.flags |= FUNC_NORET
     ida_funcs.update_func(function)
-    print('
+    print('# ...__stack_chk_fail @ %#x' % function.start_ea)
     return True
 
 
-
-
-
+# --------------------------------------------------------------------------------------
+# PROGRAM START
+# --------------------------------------------------------------------------------------
 
 def accept_file(f, n):
 
@@ -1091,22 +1146,22 @@ def accept_file(f, n):
 
 def load_file(f, neflags, format):
 
-    print('
+    print('# PS5 Kernel Loader')
 
     ps5 = Binary(f)
     if not ps5.VALID:
-        print('
+        print('# Not a PS5 kernel!')
         return 0
 
     if ps5.FILE_BASE:
-        print('
+        print('# Wrapped kernel ELF found at file offset %#x' % ps5.FILE_BASE)
 
-    
+    # PS5 Processor, Compiler, Library
     bitness = ps5.procomp('metapc', CM_N64 | CM_M_NN | CM_CC_FASTCALL, 'gnulnx_x64')
 
-    
-    
-    
+    # ----------------------------------------------------------------------------------
+    # Segment Loading
+    # ----------------------------------------------------------------------------------
     used = {}
     dynamic = None
 
@@ -1124,7 +1179,7 @@ def load_file(f, neflags, format):
             address = segm.MEM_ADDR
             size = segm.MEM_SIZE
 
-            print('
+            print('# Creating %s Segment... %#x - %#x (file %#x, %#x bytes on disk)' %
                   (label, address, address + size, ps5.FILE_BASE + segm.OFFSET, segm.FILE_SIZE))
 
             if segm.FILE_SIZE:
@@ -1143,12 +1198,12 @@ def load_file(f, neflags, format):
 
     code = idaapi.get_segm_by_name('CODE')
     if code is None:
-        print('
+        print('# No CODE segment - aborting!')
         return 0
 
-    
-    
-    
+    # ----------------------------------------------------------------------------------
+    # Dynamic Segment - this is where the PS5 kernel differs the most from the PS4 one
+    # ----------------------------------------------------------------------------------
     if dynamic is not None:
 
         members = [('tag', 'Tag', 0x8),
@@ -1166,13 +1221,13 @@ def load_file(f, neflags, format):
 
         idaapi.set_name(dynamic.MEM_ADDR, '_DYNAMIC', SN_NOCHECK | SN_NOWARN | SN_FORCE)
 
-        
-        
-        
-        
-        
-        
-        
+        # ------------------------------------------------------------------------------
+        # Relocations
+        #
+        # The PS5 kernel is shipped un-relocated: every pointer-sized field covered by
+        # the RELA table reads back as zero. Apply them, otherwise none of the tables
+        # below (sysent, cdevsw, ...) exist at all.
+        # ------------------------------------------------------------------------------
         relatab = Dynamic.TABLE.get(Dynamic.DT_RELA, 0)
         relasz = Dynamic.TABLE.get(Dynamic.DT_RELASZ, 0)
         relaent = Dynamic.TABLE.get(Dynamic.DT_RELAENT, 0x18) or 0x18
@@ -1185,19 +1240,19 @@ def load_file(f, neflags, format):
             struct_rela = make_struct('Relocation', members)
 
             count = int(relasz / relaent)
-            print('
+            print('# Applying %i Relocations from %#x...' % (count, relatab))
 
             position = ps5.v2f(relatab)
             if relaent != 0x18:
-                print('
+                print('# Unexpected DT_RELAENT %#x - skipping relocations!' % relaent)
             elif position is None:
-                print('
+                print('# Relocation table is not backed by the file - skipping!')
             else:
                 f.seek(position)
                 blob = f.read(count * relaent)
 
-                
-                
+                # The last PT_LOAD's p_memsz does not always cover every
+                # relocation target - stretch the segment so they land somewhere
                 highest = 0
                 for (offset, info, addend) in struct.iter_unpack('<QQQ', blob):
                     if (info & 0xFFFFFFFF) == Relocation.R_X86_64_RELATIVE and offset > highest:
@@ -1206,7 +1261,7 @@ def load_file(f, neflags, format):
                 last = segments()[-1] if segments() else None
                 if last is not None and highest + 0x8 > last.end_ea:
                     stretched = (highest + 0x8 + 0xFFF) & ~0xFFF
-                    print('
+                    print('# Stretching %s to %#x to cover %i out-of-bounds relocations...' %
                           (idaapi.get_segm_name(last), stretched,
                            sum(1 for (o, i, a) in struct.iter_unpack('<QQQ', blob) if o >= last.end_ea)))
                     ida_segment.set_segm_end(last.start_ea, stretched, SEGMOD_KEEP | SEGMOD_SILENT)
@@ -1228,25 +1283,25 @@ def load_file(f, neflags, format):
                         idc.op_plain_offset(offset, 0, 0)
                     applied += 1
 
-                print('
+                print('# ...%i applied, %i skipped' % (applied, skipped))
 
-                
+                # One struct + an array beats 67k create_struct calls
                 if is_mapped(relatab):
                     apply_struct(relatab, relaent, struct_rela)
                     idc.make_array(relatab, count)
                     idaapi.set_name(relatab, 'rela_dyn', SN_NOCHECK | SN_NOWARN | SN_FORCE)
 
         else:
-            
-            
-            print('
+            # The early devkit / proto kernels ship already-relocated and carry
+            # no RELA table at all
+            print('# No DT_RELA - kernel is already relocated')
 
         for (tag, name) in ((Dynamic.DT_HASH, 'hash_table'),
                             (Dynamic.DT_SYMTAB, 'symtab'),
                             (Dynamic.DT_STRTAB, 'strtab')):
             value = Dynamic.TABLE.get(tag, 0)
-            
-            
+            # Some proto kernels leave stale values in these tags - they point
+            # into the middle of .text, do not label those
             if is_mapped(value) and not in_code(value):
                 idaapi.set_name(value, name, SN_NOCHECK | SN_NOWARN | SN_FORCE)
 
@@ -1254,9 +1309,9 @@ def load_file(f, neflags, format):
         if is_mapped(initial):
             idc.add_entry(initial, initial, '.init', True)
 
-    
-    
-    
+    # ----------------------------------------------------------------------------------
+    # ELF Header / Program Header Table
+    # ----------------------------------------------------------------------------------
     address = code.start_ea
 
     members = [('File format', 0x4),
@@ -1280,8 +1335,8 @@ def load_file(f, neflags, format):
                ('Number of entries in SHT', 0x2),
                ('SHT entry index for string table\n', 0x2)]
 
-    
-    
+    # Only annotate if the ELF header itself was mapped in (it usually is not on PS5,
+    # the first loadable segment starts past it)
     if idaapi.get_dword(address) == 0x464C457F:
         for (comment, size) in members:
             flags = idaapi.get_flags_by_size(size)
@@ -1305,13 +1360,13 @@ def load_file(f, neflags, format):
                 idc.set_cmt(address, comment, False)
                 address += size
 
-    
+    # Start Function
     idc.add_entry(ps5.E_START_ADDR, ps5.E_START_ADDR, 'start', True)
 
-    
-    
-    
-    
+    # Xfast_syscall
+    #   swapgs
+    #   mov  gs:[PCPU_SCRATCH], rsp      ; 0x2A8 on the PS4, 0x7A8 on the PS5
+    #   mov  rsp, gs:[PCPU_RSP0]
     address = find_binary(code.start_ea, code.end_ea,
                           '0F 01 F8 65 48 89 24 25 ?? ?? 00 00 65 48 8B 24 25', 0x10, SEARCH_DOWN)
     if address != BADADDR:
@@ -1319,22 +1374,22 @@ def load_file(f, neflags, format):
         idaapi.create_insn(address)
         idaapi.add_func(address, BADADDR)
         idaapi.set_name(address, 'Xfast_syscall', SN_NOCHECK | SN_NOWARN | SN_FORCE)
-        print('
+        print('# Xfast_syscall @ %#x' % address)
 
-    
-    
-    
+    # ----------------------------------------------------------------------------------
+    # CFI / execute-only thunks
+    # ----------------------------------------------------------------------------------
     try:
-        print('
-        print('
+        print('# Processing Prospero\'s CFI Thunks...')
+        print('# ...%i thunks' % prospero(code))
     except Exception as exception:
-        print('
+        print('# CFI thunk pass failed: %s' % exception)
 
-    
-    
-    
+    # ----------------------------------------------------------------------------------
+    # Znullptr's syscalls - the PS5 kernel carries a native table and a PS4 one
+    # ----------------------------------------------------------------------------------
     try:
-        print('
+        print('# Processing Znullptr\'s Syscalls...')
 
         members = [('sy_narg', 'Number of Arguments', 0x4),
                    ('_pad', 'Padding', 0x4),
@@ -1354,24 +1409,24 @@ def load_file(f, neflags, format):
         for (tag, abi) in (('ps5', 'Native SELF'), ('ps4', 'PS4 SELF'), ('freebsd', 'FreeBSD ELF64')):
             info = find_sysentvec(abi)
             if info is None:
-                print('
+                print('#   %-14s not found (%r)' % (tag, abi))
                 continue
             tables.append((tag, info))
 
         if tables:
-            print('
+            print('# ...%i unique syscall handlers named' %
                   znullptr(tables, struct_sysent, struct_sysentvec))
         else:
-            print('
+            print('# No syscall tables found!')
 
     except Exception as exception:
-        print('
+        print('# Syscall pass failed: %s' % exception)
 
-    
-    
-    
+    # ----------------------------------------------------------------------------------
+    # Chendo's cdevsw con-struct-or
+    # ----------------------------------------------------------------------------------
     try:
-        print('
+        print('# Processing Chendo\'s Structures...')
 
         members = [('d_version', 'Version', 0x4),
                    ('d_flags', 'Flags', 0x4),
@@ -1399,18 +1454,18 @@ def load_file(f, neflags, format):
                    ('d_spare7', 'Spare7', 0x4)]
         struct_cdevsw = make_struct('cdevsw', members)
 
-        print('
+        print('# ...%i cdevsw structures' % chendo(struct_cdevsw))
 
     except Exception as exception:
-        print('
+        print('# cdevsw pass failed: %s' % exception)
 
-    
-    
-    
+    # ----------------------------------------------------------------------------------
+    # Pablo's IDC
+    # ----------------------------------------------------------------------------------
     try:
-        print('
+        print('# Processing Pablo\'s Push IDC...')
 
-        
+        # Script 1) Push it real good...
         pablo(0, code.start_ea, 0x10, '55 48 89')
         pablo(2, code.start_ea, code.end_ea, '90 90 55 48 ??')
         pablo(2, code.start_ea, code.end_ea, 'C3 90 55 48 ??')
@@ -1455,7 +1510,7 @@ def load_file(f, neflags, format):
         pablo(8, code.start_ea, code.end_ea, 'C3 0F 1F 80 00 00 00 00 48')
         pablo(8, code.start_ea, code.end_ea, '0F 1F 84 00 00 00 00 00 53 48 83 EC')
 
-        
+        # Special cases patterns set
         pablo(13, code.start_ea, code.end_ea, 'C3 90 90 90 90 90 90 90 90 90 90 90 90 48')
         pablo(13, code.start_ea, code.end_ea, 'C3 90 90 90 90 90 90 90 90 90 90 90 90 55')
         pablo(17, code.start_ea, code.end_ea, 'E9 ?? ?? ?? ?? 90 90 90 90 90 90 90 90 90 90 90 90 48')
@@ -1464,19 +1519,19 @@ def load_file(f, neflags, format):
         pablo(20, code.start_ea, code.end_ea, 'E9 ?? ?? ?? ?? 90 90 90 90 90 90 90 90 90 90 90 90 90 90 90 48')
 
     except Exception as exception:
-        print('
+        print('# Prologue pass failed: %s' % exception)
 
-    
-    
-    
+    # ----------------------------------------------------------------------------------
+    # Kiwidog's __stack_chk_fail
+    # ----------------------------------------------------------------------------------
     try:
-        print('
+        print('# Processing Kiwidog\'s Stack Functions...')
         if not kiwidog(code):
-            print('
+            print('# ...__stack_chk_fail not found')
     except Exception as exception:
-        print('
+        print('# __stack_chk_fail pass failed: %s' % exception)
 
-    print('
+    print('# Done!')
     return 1
 
-
+# PROGRAM END
